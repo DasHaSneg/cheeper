@@ -8,6 +8,7 @@ import (
 	"log"
 	"math/rand"
 	"os"
+	"sort"
 	"strconv"
 	"time"
 
@@ -16,18 +17,14 @@ import (
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
+	"gopkg.in/gookit/color.v1"
 )
 
 var messagesCol *mongo.Collection
 var usersCol *mongo.Collection
+var friendshipsCol *mongo.Collection
 var ctx = context.TODO()
 
-//type User struct {
-//	ID	primitive.ObjectID `bson:"_id"`
-//	Name string `bson:"text"`
-//	Login string `bson:"text"`
-//}
-//
 type Message struct {
 	ID        primitive.ObjectID `bson:"_id"`
 	CreatedAt time.Time          `bson:"created_at"`
@@ -36,20 +33,13 @@ type Message struct {
 	UserId    primitive.ObjectID `bson:"user_id"`
 }
 
-//
-//type Friends struct {
-//	ID        primitive.ObjectID `bson:"_id"`
-//	User1Id   primitive.ObjectID `bson:"user1_id"`
-//	User2Id   primitive.ObjectID `bson:"user2_id"`
-//	StartedAt time.Time          `bson:"started_at"`
-//}
-
-type Friend struct {
-	//ID        primitive.ObjectID `bson:"_id"`
-	//CreatedAt time.Time `bson:"created_at"`
-	//UpdatedAt time.Time `bson:"updated_at"`
+type Friendship struct {
+	ID        primitive.ObjectID `bson:"_id"`
+	CreatedAt time.Time          `bson:"created_at"`
+	UpdatedAt time.Time          `bson:"updated_at"`
+	User1Id   primitive.ObjectID `bson:"user1_id"`
+	User2Id   primitive.ObjectID `bson:"user2_id"`
 	StartedAt time.Time          `bson:"started_at"`
-	UserId    primitive.ObjectID `bson:"user_id"`
 }
 
 type User struct {
@@ -59,7 +49,7 @@ type User struct {
 	Name      string             `bson:"name"`
 	Login     string             `bson:"login"`
 	//Messages []*Message `bson:"messages"`
-	Friends []*Friend `bson:"friends"`
+	//Friends []*Friend `bson:"friends"`
 }
 
 func main() {
@@ -85,7 +75,44 @@ func main() {
 				},
 			},
 			{
-				Name:    "addFriend",
+				Name:    "createUser",
+				Aliases: []string{"u"},
+				Usage:   "add user",
+				Action: func(c *cli.Context) error {
+					args := c.Args().Slice()
+					login := args[0]
+					name := args[1]
+					if login == "" || name == "" {
+						return errors.New("Specify user's login and name")
+					}
+					timeNow := time.Now()
+					user := &User{
+						ID:        primitive.NewObjectID(),
+						CreatedAt: timeNow,
+						UpdatedAt: timeNow,
+						Name:      name,
+						Login:     login,
+					}
+
+					return sendUser(user)
+				},
+			},
+			{
+				Name:    "createMessage",
+				Aliases: []string{"m"},
+				Usage:   "add message",
+				Action: func(c *cli.Context) error {
+					args := c.Args().Slice()
+					login := args[0]
+					text := args[1]
+					if login == "" || text == "" {
+						return errors.New("Specify user's login and text")
+					}
+					return addMessage(login, text)
+				},
+			},
+			{
+				Name:    "createFriendship",
 				Aliases: []string{"f"},
 				Usage:   "add friend",
 				Action: func(c *cli.Context) error {
@@ -103,6 +130,42 @@ func main() {
 					return addFriend(userLogin, friendLogin)
 				},
 			},
+			{
+				Name:    "getFriendName",
+				Aliases: []string{"fn"},
+				Usage:   "get friend's names",
+				Action: func(c *cli.Context) error {
+					login := c.Args().First()
+					if login == "" {
+						return errors.New("Specify user's login")
+					}
+
+					names, err := getFriendsNames(login)
+					if err != nil {
+						return err
+					}
+					printNames(names)
+					return nil
+				},
+			},
+			{
+				Name:    "countFriends",
+				Aliases: []string{"cf"},
+				Usage:   "get num of friend's",
+				Action: func(c *cli.Context) error {
+					login := c.Args().First()
+					if login == "" {
+						return errors.New("Specify user's login")
+					}
+
+					num, err := countFriends(login)
+					if err != nil {
+						return err
+					}
+					color.Green.Printf("%d", num)
+					return nil
+				},
+			},
 		},
 	}
 
@@ -112,14 +175,35 @@ func main() {
 	}
 }
 
-func createUser(user *User) error {
+func sendUser(user *User) error {
 	_, err := usersCol.InsertOne(ctx, user)
 	return err
 }
 
-func createMessage(message *Message) error {
+func sendMessage(message *Message) error {
 	_, err := messagesCol.InsertOne(ctx, message)
 	return err
+}
+
+func sendFriendship(friendship *Friendship) error {
+	_, err := friendshipsCol.InsertOne(ctx, friendship)
+	return err
+}
+
+func addMessage(userLogin string, text string) error {
+	user, err := getUserByLogin(userLogin)
+	if err != nil {
+		return err
+	}
+	timeNow := time.Now()
+	message := &Message{
+		ID:        primitive.NewObjectID(),
+		CreatedAt: timeNow,
+		UpdatedAt: timeNow,
+		Text:      text,
+		UserId:    user.ID,
+	}
+	return sendMessage(message)
 }
 
 func addFriend(userLogin string, friendLogin string) error {
@@ -134,31 +218,53 @@ func addFriend(userLogin string, friendLogin string) error {
 		return err
 	}
 
-	friendship := &Friend{
-		StartedAt: time.Now(),
-		UserId:    friend.ID,
-	}
-
-	if checkFriendShip(friend, user.ID) {
+	if checkFriendShip(user.ID, friend.ID) {
 		return errors.New("Users are already friends")
 	}
 
-	filter := bson.D{primitive.E{Key: "login", Value: userLogin}}
+	timeNow := time.Now()
+	friendship := &Friendship{
+		ID:        primitive.NewObjectID(),
+		CreatedAt: timeNow,
+		UpdatedAt: timeNow,
+		User1Id:   user.ID,
+		User2Id:   user.ID,
+		StartedAt: time.Now(),
+	}
 
-	update := bson.D{primitive.E{Key: "$push", Value: bson.D{
-		primitive.E{Key: "friends", Value: friendship},
-	}}}
-
-	u := &User{}
-	return usersCol.FindOneAndUpdate(ctx, filter, update).Decode(u)
+	return sendFriendship(friendship)
 }
 
-func countFriends(userLogin string) (int, error) {
+func checkFriendShip(userId primitive.ObjectID, friendId primitive.ObjectID) bool {
+	ids, err := getFriendsIdsById(userId)
+	if err != nil {
+		return false
+	}
+	for _, i := range ids {
+		if i == friendId {
+			return true
+		}
+	}
+	return false
+}
+
+func countFriends(userLogin string) (int32, error) {
 	user, err := getUserByLogin(userLogin)
 	if err != nil {
 		return 0, err
 	}
-	return len(user.Friends), nil
+	matchStage := bson.D{{"$match", bson.D{{"user1_id", user.ID}}}}
+	countStage := bson.D{{"$count", "total"}}
+
+	showInfoCursor, err := friendshipsCol.Aggregate(ctx, mongo.Pipeline{matchStage, countStage})
+	if err != nil {
+		panic(err)
+	}
+	var showsWithInfo []bson.M
+	if err = showInfoCursor.All(ctx, &showsWithInfo); err != nil {
+		panic(err)
+	}
+	return showsWithInfo[0]["total"].(int32), nil
 }
 
 func getFriendsNames(userLogin string) ([]string, error) {
@@ -166,35 +272,27 @@ func getFriendsNames(userLogin string) ([]string, error) {
 	if err != nil {
 		return []string{}, err
 	}
+
+	friendsIds, err := getFriendsIdsById(user.ID)
+	if err != nil {
+		return []string{}, err
+	}
 	var names []string
-	for _, friendship := range user.Friends {
-		friend, err := getUserByID(friendship.UserId)
+	for _, friendId := range friendsIds {
+		friend, err := getUserByID(friendId)
 		if err != nil {
 			return []string{}, err
 		}
 		names = append(names, friend.Name)
 	}
+	sort.Strings(names)
 	return names, nil
 }
 
-func checkFriendShip(user *User, userIdForCheck primitive.ObjectID) bool {
-	friends := filterFriendArray(user.Friends, userIdForCheck)
-	if len(friends) == 0 {
-		return false
+func printNames(names []string) {
+	for _, n := range names {
+		color.Green.Printf("%s\n", n)
 	}
-	return true
-}
-
-func filterFriendArray(friends []*Friend, userID primitive.ObjectID) []*Friend {
-	var users []*Friend
-
-	for _, friend := range friends {
-
-		if friend.UserId == userID {
-			users = append(users, friend)
-		}
-	}
-	return users
 }
 
 func getUserByLogin(login string) (*User, error) {
@@ -209,6 +307,36 @@ func getUserByID(userID primitive.ObjectID) (*User, error) {
 	u := &User{}
 	err := usersCol.FindOne(ctx, filter).Decode(u)
 	return u, err
+}
+
+func getFriendsIdsById(userID primitive.ObjectID) ([]primitive.ObjectID, error) {
+	filter := bson.D{primitive.E{Key: "user1_id", Value: userID}}
+	var ids []primitive.ObjectID
+	cur, err := friendshipsCol.Find(ctx, filter)
+	if err != nil {
+		return ids, err
+	}
+
+	for cur.Next(ctx) {
+		var f Friendship
+		err := cur.Decode(&f)
+		if err != nil {
+			return ids, err
+		}
+		ids = append(ids, f.User2Id)
+	}
+
+	if err := cur.Err(); err != nil {
+		return ids, err
+	}
+
+	cur.Close(ctx)
+
+	if len(ids) == 0 {
+		return ids, mongo.ErrNoDocuments
+	}
+
+	return ids, nil
 }
 
 func filterUsers(filter interface{}) ([]*User, error) {
@@ -251,8 +379,10 @@ func init() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	usersCol = client.Database("cheeper").Collection("users")
-	messagesCol = client.Database("cheeper").Collection("messages")
+	database := client.Database("cheeper")
+	usersCol = database.Collection("users")
+	messagesCol = database.Collection("messages")
+	friendshipsCol = database.Collection("friendships")
 }
 
 func addTestData(numUsers int) error {
@@ -267,6 +397,9 @@ func addTestData(numUsers int) error {
 	usersArray := createTestUsers(numUsers, userIds)
 	_, err := usersCol.InsertMany(ctx, usersArray)
 
+	friendshipsArray := createTestFriendships(numUsers, userIds)
+	_, err = friendshipsCol.InsertMany(ctx, friendshipsArray)
+
 	messagesArray := createTestMessages(numUsers, userIds)
 	_, err = messagesCol.InsertMany(ctx, messagesArray)
 
@@ -276,44 +409,16 @@ func createTestUsers(numUsers int, userIds []primitive.ObjectID) []interface{} {
 	usersArray := []interface{}{}
 	var user *User
 	var userId primitive.ObjectID
-	var friendIndex int
-	var friend *Friend
 	timeNow := time.Now()
 	createdAt, updatedAt := timeNow, timeNow
 	for i := 0; i < numUsers; i++ {
 		userId = userIds[i]
-
-		friendIndex = randInt(0, numUsers)
-		for friendIndex == i {
-			friendIndex = randInt(0, numUsers)
-		}
-
-		friend = &Friend{
-			StartedAt: createdAt,
-			UserId:    userIds[friendIndex],
-		}
-
-		//numMessages = randInt(1, 6)
-		//messages = make([]*Message, numMessages)
-		//for j = 0; j < numMessages; j++ {
-		//	message = &Message{
-		//		//ID: primitive.NewObjectID(),
-		//		CreatedAt: createdAt,
-		//		UpdatedAt: updatedAt,
-		//		Text: fmt.Sprintf("message number %d for user_%d", j, i),
-		//		UserId: userId,
-		//	}
-		//	messages = append(messages, message)
-		//}
-		//j = 0
-
 		user = &User{
 			ID:        userId,
 			CreatedAt: createdAt,
 			UpdatedAt: updatedAt,
 			Name:      fmt.Sprintf("user_%d", i),
 			Login:     fmt.Sprintf("login_%d", i),
-			Friends:   []*Friend{friend},
 		}
 
 		usersArray = append(usersArray, user)
@@ -339,6 +444,29 @@ func createTestMessages(numUsers int, userIds []primitive.ObjectID) []interface{
 		messagesArray = append(messagesArray, message)
 	}
 	return messagesArray
+}
+
+func createTestFriendships(numUsers int, userIds []primitive.ObjectID) []interface{} {
+	friendshipsArray := []interface{}{}
+	var friendIndex int
+	var friendship *Friendship
+	timeNow := time.Now()
+	for i := 0; i < numUsers; i++ {
+		friendIndex = randInt(0, numUsers)
+		for friendIndex == i {
+			friendIndex = randInt(0, numUsers)
+		}
+		friendship = &Friendship{
+			ID:        primitive.NewObjectID(),
+			CreatedAt: timeNow,
+			UpdatedAt: timeNow,
+			User1Id:   userIds[i],
+			User2Id:   userIds[friendIndex],
+			StartedAt: timeNow,
+		}
+		friendshipsArray = append(friendshipsArray, friendship)
+	}
+	return friendshipsArray
 }
 
 func randInt(min int, max int) int {
